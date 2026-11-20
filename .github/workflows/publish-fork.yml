@@ -1,0 +1,214 @@
+name: Publish latest (fork)
+run-name: Publish ${{ github.sha }} by ${{ github.actor }}
+
+# Fork-only publishing, kept on the `releases` branch so `main` can stay identical
+# to upstream. Every push to `releases` mirrors upstream's Release workflow (release.yml):
+# builds the Java server, builds kroki + the companion images on native runners, and
+# pushes them to this fork's GHCR packages (ghcr.io/<owner>/kroki*) as
+# :<YYYYMMDDHHmmSS> (UTC time of the commit) + :latest, then tags the commit and creates
+# a GitHub Release with the same version and the standalone server jar.
+#
+# Unlike upstream, ditaa and UMLet are built from tools/ in the same build instead of
+# copying upstream's published binaries, see docker-bake-fork.hcl.
+#
+# This is a new file on purpose: upstream's workflows are left untouched so merging
+# `main` into `releases` never conflicts. The Release is created with GITHUB_TOKEN,
+# which never triggers other workflows.
+on:
+  push:
+    branches: [releases]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-fork
+  cancel-in-progress: false
+
+env:
+  BAKE_FILES: -f docker-bake.hcl -f docker-bake-release.hcl -f docker-bake-fork.hcl
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Commit time, not build time: re-running the workflow on the same commit
+      # re-publishes the same version instead of minting a new one.
+      - name: Resolve version (UTC commit timestamp)
+        id: v
+        run: echo "ver=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+      - name: Install GraphViz
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq --yes graphviz > /dev/null
+      - name: Set up the build tools
+        uses: jdx/mise-action@v5
+        with:
+          version: 2026.11.6
+          install_args: java task
+      # Not committed: only the built artifacts carry the version
+      - name: Set version
+        run: task mavenSetVersion
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.ver }}
+      - name: Build Java server
+        run: task mavenBuild
+      - name: Generate checksums
+        run: |
+          cp kroki-server.jar "kroki-standalone-server-$VER.jar"
+          sha512sum "kroki-standalone-server-$VER.jar" > "kroki-standalone-server-$VER.sha512sum.txt"
+          md5sum "kroki-standalone-server-$VER.jar" > "kroki-standalone-server-$VER.md5sum.txt"
+        working-directory: server/target
+        env:
+          VER: ${{ steps.v.outputs.ver }}
+      - name: Upload Java server
+        uses: actions/upload-artifact@v7
+        with:
+          name: kroki-server
+          path: |
+            server/target/kroki-server.jar
+            server/target/kroki-standalone-server-*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Each platform is built on a native runner (no QEMU emulation) and pushed by digest,
+  # then publish merges the digests into tagged multi-platform images.
+  build_images:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    needs: server
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download Java server
+        uses: actions/download-artifact@v8
+        with:
+          name: kroki-server
+          path: server/target
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: 'v0.38.2'
+          driver-opts: image=moby/buildkit:v0.34.2
+          buildkitd-config: .github/buildkitd.toml
+      - name: Log in to GHCR
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # BuildKit uses the GitHub Actions cache API directly (cache type=gha, see docker-bake.hcl),
+      # but only JavaScript actions receive its URL and token: expose them to the next steps.
+      - name: Expose the GitHub Actions cache API
+        uses: actions/github-script@v9
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL)
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN)
+      # A named build context only replaces a FROM whose reference matches it exactly:
+      # fail instead of silently shipping upstream's binaries if the FROM lines change.
+      - name: Resolve the ditaa and UMLet images to replace
+        run: |
+          ditaa=$(sed -nE 's/^FROM (ghcr\.io\/yuzutech\/kroki-builder-ditaa:[^ ]+) AS ditaa$/\1/p' server/ops/docker/Dockerfile)
+          umlet=$(sed -nE 's/^FROM (ghcr\.io\/yuzutech\/kroki-builder-umlet:[^ ]+) AS umlet$/\1/p' server/ops/docker/Dockerfile)
+          if [ -z "$ditaa" ] || [ -z "$umlet" ]; then
+            echo "::error::ditaa/UMLet FROM instructions not found in server/ops/docker/Dockerfile"
+            exit 1
+          fi
+          echo "DITAA_IMAGE=$ditaa" >> "$GITHUB_ENV"
+          echo "UMLET_IMAGE=$umlet" >> "$GITHUB_ENV"
+      - name: Push Docker images (${{ matrix.platform }}) by digest
+        run: |
+          mkdir -p "$(dirname "$METADATA_FILE")"
+          docker buildx bake $BAKE_FILES kroki companion-images --set "*.platform=$PLATFORM" --metadata-file "$METADATA_FILE"
+        env:
+          RELEASE_VERSION: ${{ needs.server.outputs.version }}
+          PUSH_BY_DIGEST: 'true'
+          PLATFORM: ${{ matrix.platform }}
+          METADATA_FILE: ${{ runner.temp }}/image-metadata/${{ runner.arch }}.json
+          GHA_CACHE_SCOPE: fork-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+          GHA_CACHE_WRITE: 'true'
+      - name: Upload image digests
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-metadata-${{ runner.arch }}
+          path: ${{ runner.temp }}/image-metadata/${{ runner.arch }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    runs-on: ubuntu-24.04
+    needs: [server, build_images]
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download image digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-metadata-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/image-metadata
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: 'v0.38.2'
+          driver-opts: image=moby/buildkit:v0.34.2
+      - name: Log in to GHCR
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Same as upstream's dockerMergeImages task, with the fork bake file;
+      # fork-ditaa/fork-umlet are build-only targets (no tags) and are skipped.
+      - name: Publish Docker images :${{ needs.server.outputs.version }} + :latest
+        run: |
+          set -e
+          bake=$(docker buildx bake $BAKE_FILES kroki companion-images --print)
+          for target in $(echo "$bake" | jq -r '.target | to_entries[] | select(.value.tags != null) | .key'); do
+            tags=$(echo "$bake" | jq -r --arg t "$target" '.target[$t].tags | map("--tag " + .) | join(" ")')
+            repository=$(echo "$bake" | jq -r --arg t "$target" '.target[$t].tags[0] | sub(":[^:]*$"; "")')
+            images=$(jq -r --arg t "$target" --arg r "$repository" '"\($r)@\(.[$t]["containerimage.digest"])"' "$METADATA_DIR"/*.json)
+            docker buildx imagetools create $tags $images
+          done
+        env:
+          RELEASE_VERSION: ${{ needs.server.outputs.version }}
+          METADATA_DIR: ${{ runner.temp }}/image-metadata
+          # only read by the FROM lookup of the kroki target, not needed to print the tags
+          DITAA_IMAGE: unused-ditaa
+          UMLET_IMAGE: unused-umlet
+      - name: Download Java server
+        uses: actions/download-artifact@v8
+        with:
+          name: kroki-server
+          path: server/target
+      # Bare timestamp tag (no leading v) so it never mixes with upstream's v* tags.
+      # Re-running on the same commit only re-uploads the jar.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ needs.server.outputs.version }}
+        run: |
+          if ! gh release view "$VER" >/dev/null 2>&1; then
+            {
+              printf '## Images\n\n```\n'
+              for image in kroki kroki-mermaid kroki-bpmn kroki-excalidraw kroki-diagramsnet; do
+                printf 'docker pull %s/%s:%s\n' "$REGISTRY" "$image" "$VER"
+              done
+              printf '```\n'
+            } > .notes.md
+            gh release create "$VER" --target "$GITHUB_SHA" --title "$VER" \
+              --notes-file .notes.md --generate-notes --latest
+          fi
+          gh release upload "$VER" server/target/kroki-standalone-server-* --clobber
